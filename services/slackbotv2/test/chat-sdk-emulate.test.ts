@@ -992,6 +992,129 @@ describe('slackbotv2', () => {
     ).toEqual(expect.objectContaining({ model: 'gpt-5.4' }))
   })
 
+  it('switches a sticky thread to a named configured model and forwards its default effort', async () => {
+    const previous = process.env.CODEX_CUSTOM_PROVIDERS
+    process.env.CODEX_CUSTOM_PROVIDERS = JSON.stringify({
+      private: { name: 'Private Inference', defaultModel: 'atlas-full', models: {
+        'atlas-full': { displayName: 'Atlas Full', aliases: ['atlas'],
+          reasoningEfforts: ['low', 'max'], defaultReasoning: 'max' }
+      } }
+    })
+    try {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      bot = createTestBot({
+        state: sharedState,
+        responseMetadataMode: 'first',
+        messageOverridesStrategy: createOpenAiMessageOverridesStrategy({
+          apiKey: 'test-key', model: 'classifier',
+          fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => Response.json({ answers: [
+            { name: 'selection_request', probability: 0.99, type: 'predicate' },
+            { name: 'model', choice: String(init?.body).includes('use Sol') ? 'gpt-6.1-sol' : 'private/atlas-full', type: 'choice' }
+          ] })) as unknown as typeof fetch
+        })
+      })
+      const parent = await sendMessage(`<@${BOT_USER_ID}> --codex --model gpt-6.1-sol start here`)
+      await parent.finished()
+      const switched = await sendMessage(`<@${BOT_USER_ID}> switch to Atlas for this`, { threadTs: parent.ts })
+      await switched.finished()
+      const followup = await sendMessage(`<@${BOT_USER_ID}> continue the work`, { threadTs: parent.ts })
+      await followup.finished()
+      for (const execution of codexApi.executes.slice(1)) {
+        const line = JSON.parse(execution.body.input_lines.at(-1)!)
+        expect(line.model).toBe('atlas-full')
+        expect(line.provider).toBe('private')
+        expect(line.reasoning).toBe('max')
+      }
+      expect(codexApi.executes).toHaveLength(3)
+      expect(await sharedState.get(`thread-state:${threadKey(parent.ts)}`)).toMatchObject({
+        model: 'atlas-full', provider: 'private', harnessType: 'codex'
+      })
+      const reset = await sendMessage(`<@${BOT_USER_ID}> use Sol again`, { threadTs: parent.ts })
+      await reset.finished()
+      const resetLine = JSON.parse(codexApi.executes[3]!.body.input_lines.at(-1)!)
+      expect(resetLine.model).toBe('gpt-6.1-sol')
+      // Slack clears the provider; the harness resolves the default route.
+      expect(resetLine.provider).toBeUndefined()
+      const invalid = await sendMessage(`<@${BOT_USER_ID}> --provider openrouter --model atlas use this`, { threadTs: parent.ts })
+      await invalid.finished()
+      expect(codexApi.executes).toHaveLength(4)
+      expect(await threadText(parent.ts)).toContain('incompatible')
+      const stopBlocks = slackApi.calls.filter(call => call.method === 'chat.stopStream')
+      expect(JSON.stringify(stopBlocks)).toContain('Atlas Full · Private Inference · Codex · Max')
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CUSTOM_PROVIDERS
+      else process.env.CODEX_CUSTOM_PROVIDERS = previous
+    }
+  })
+
+  it('clears a catalogued provider for a model-only flag and keeps an uncatalogued one', async () => {
+    const previous = process.env.CODEX_CUSTOM_PROVIDERS
+    process.env.CODEX_CUSTOM_PROVIDERS = JSON.stringify({
+      private: { name: 'Private Inference', models: { 'atlas-full': { displayName: 'Atlas Full' } } },
+      plain: { name: 'Plain Inference' }
+    })
+    try {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      bot = createTestBot({ state: sharedState })
+      for (const [provider, model, expected] of [
+        ['private', 'atlas-full', undefined],
+        ['plain', 'plain-model', 'plain']
+      ] as const) {
+        const parent = await sendMessage(`<@${BOT_USER_ID}> --provider ${provider} --model ${model} start here`)
+        await parent.finished()
+        const switched = await sendMessage(`<@${BOT_USER_ID}> --model gpt-6.1-sol continue`, { threadTs: parent.ts })
+        await switched.finished()
+        const line = JSON.parse(codexApi.executes.at(-1)!.body.input_lines.at(-1)!)
+        expect(line.model).toBe('gpt-6.1-sol')
+        expect(line.provider).toBe(expected)
+        expect((await sharedState.get<Record<string, unknown>>(`thread-state:${threadKey(parent.ts)}`))?.provider)
+          .toBe(expected ?? null)
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CUSTOM_PROVIDERS
+      else process.env.CODEX_CUSTOM_PROVIDERS = previous
+    }
+  })
+
+  it('switches a pinned model using default Claude and versioned Codex names', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      state: sharedState,
+      messageOverridesStrategy: createOpenAiMessageOverridesStrategy({
+        apiKey: 'test-key', model: 'classifier',
+        fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const request = JSON.parse(String(init?.body))
+          const text = String(request.input.at(-1).content)
+          const model = text.includes('use claude') ? 'claude-opus-5-5'
+            : text.includes('pro') ? 'gpt-5.4-pro' : 'gpt-5.5'
+          return Response.json({ answers: [
+            { name: 'selection_request', probability: 0.99, type: 'predicate' },
+            { name: 'model', choice: model, type: 'choice' }
+          ] })
+        }) as unknown as typeof fetch
+      })
+    })
+    const parent = await sendMessage(`<@${BOT_USER_ID}> --codex --model gpt-6.1-sol start here`)
+    await parent.finished()
+    for (const [text, harness, model] of [
+      ['use claude', 'claudecode', 'claude-opus-5-5'],
+      ['switch to codex 5.5', 'codex', 'gpt-5.5'],
+      ['switch to codex 5.4 pro', 'codex', 'gpt-5.4-pro']
+    ] as const) {
+      const followup = await sendMessage(`<@${BOT_USER_ID}> ${text}`, { threadTs: parent.ts })
+      await followup.finished()
+      expect(codexApi.creates.at(-1)!.body.harness_type).toBe(harness)
+      expect(JSON.parse(codexApi.executes.at(-1)!.body.input_lines.at(-1)!).model).toBe(model)
+      expect(await sharedState.get(`thread-state:${threadKey(parent.ts)}`)).toMatchObject({
+        harnessType: harness, model
+      })
+    }
+    expect(codexApi.executes).toHaveLength(4)
+  })
+
   it('keeps a top-level harness flag pinned when the LLM strategy guesses another harness', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -3613,6 +3736,119 @@ describe('slackbotv2', () => {
     expect(await threadText(parent.ts)).toContain('Deploy is fine.')
   })
 
+  it('posts progress updates as separate thread messages once, even when recovery replays them', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createProductionDefaultTestBot({ activitySummaryStatusEnabled: true, state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a long task.')
+    const mentionText = `<@${BOT_USER_ID}> audit every service`
+    const mention = await sendMessage(mentionText, { threadTs: parent.ts })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const key = threadKey(parent.ts)
+    const summary = "I'm auditing the billing service"
+    const progress = 'I audited billing and found two stale configs; now checking the search service.'
+    codexApi.emitSessionEvent(key, 'session.activity_summary', { summary })
+    codexApi.emitSessionEvent(key, 'session.progress_update', { elapsed_secs: 120, text: progress })
+    await waitFor(async () => (await threadTexts(parent.ts)).includes(progress))
+    codexApi.emitOutputLine(key, JSON.stringify({ type: 'turn.done', result: 'Audit complete.' }))
+    await mention.finished()
+
+    const texts = await threadTexts(parent.ts)
+    expect(texts.filter(text => text === progress)).toHaveLength(1)
+    expect(texts.indexOf(progress)).toBeLessThan(
+      texts.findIndex(text => text.includes('Audit complete.'))
+    )
+    // Posting in the thread clears Slack's assistant status, so it is restored.
+    const statuses = slackApi.calls
+      .filter(call => call.method === 'assistant.threads.setStatus')
+      .map(call => stringField(call.body.status))
+    expect(statuses).toEqual(['Thinking...', summary, summary, ''])
+
+    // A recovery render replays the execution from its start.
+    const stopStreams = () => slackApi.calls.filter(call => call.method === 'chat.stopStream').length
+    const stopStreamsBeforeRecovery = stopStreams()
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-progress-replay',
+        message: apiMessageFromSlackEvent({
+          isMention: true,
+          text: mentionText,
+          threadId: key,
+          ts: mention.ts
+        })
+      }
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+    bot = createProductionDefaultTestBot({ activitySummaryStatusEnabled: true, state: sharedState })
+    await waitFor(() => stopStreams() > stopStreamsBeforeRecovery, 2000)
+
+    expect((await threadTexts(parent.ts)).filter(text => text === progress)).toHaveLength(1)
+  })
+
+  it('skips a progress update once the answer is already streaming', async () => {
+    bot = createProductionDefaultTestBot({ activitySummaryStatusEnabled: true })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a streaming answer.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> audit every service`, {
+      threadTs: parent.ts
+    })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const key = threadKey(parent.ts)
+    // Complete lines, long enough to flush the Slack SDK's stream buffer.
+    const answer = `Audit started streaming.\n\n${'x'.repeat(300)}\n\n`
+    const lines = sampleCodexOutputLines(answer)
+    const turnCompleted = lines.pop()!
+    const answerDelta = lines.at(-1)!
+    codexApi.emitOutputLines(key, lines)
+    // Buffered answer text flushes on the first event after the pre-stream grace.
+    await new Promise(resolve => setTimeout(resolve, 600))
+    codexApi.emitOutputLine(key, answerDelta.replace(answer, ' Still going.'))
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.startStream'))
+    const progress = 'I audited billing; now checking the search service.'
+    codexApi.emitSessionEvent(key, 'session.progress_update', { elapsed_secs: 120, text: progress })
+    codexApi.emitOutputLine(key, turnCompleted)
+    await mention.finished()
+
+    const texts = await threadTexts(parent.ts)
+    expect(texts.some(text => text.includes('Audit started streaming.'))).toBe(true)
+    expect(texts).not.toContain(progress)
+  })
+
+  it('drops progress updates that are already stale when rendered', async () => {
+    bot = createProductionDefaultTestBot({ activitySummaryStatusEnabled: true })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a long-running task.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> audit every service`, {
+      threadTs: parent.ts
+    })
+    expect(mention.response.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const key = threadKey(parent.ts)
+    const stale = 'I am starting with the billing service.'
+    const current = 'I audited billing; now checking the search service.'
+    codexApi.emitSessionEvent(key, 'session.progress_update', {
+      created_at_ms: Date.now() - 10 * 60 * 1000,
+      text: stale
+    })
+    codexApi.emitSessionEvent(key, 'session.progress_update', { created_at_ms: Date.now(), text: current })
+    await waitFor(async () => (await threadTexts(parent.ts)).includes(current))
+    codexApi.emitOutputLine(key, JSON.stringify({ type: 'turn.done', result: 'Audit complete.' }))
+    await mention.finished()
+
+    expect(await threadTexts(parent.ts)).not.toContain(stale)
+  })
+
   it('restores the default status after a steering message when no summary was published', async () => {
     bot = createProductionDefaultTestBot()
     codexApi.autoRespond = false
@@ -4902,6 +5138,28 @@ describe('proactive replies', () => {
     expect(sessionMessageTexts(codexApi.appends.flatMap(append => append.body.messages)))
       .toContain('what about staging?')
     expect(await threadText(threadTs)).toContain('Executed request 2.')
+  })
+
+  it('answers a proactive follow-up with flag-like text without a selection error', async () => {
+    const previous = process.env.CODEX_CUSTOM_PROVIDERS
+    process.env.CODEX_CUSTOM_PROVIDERS = JSON.stringify({
+      private: { name: 'Private Inference', models: { 'atlas-full': { displayName: 'Atlas Full', aliases: ['atlas'] } } }
+    })
+    try {
+      createProactiveBot(() => ({ respond: true }))
+      const threadTs = await mentionThread('Proactive selection context.')
+
+      await reply('does --claude --model atlas work here?', threadTs)
+
+      expect(await threadText(threadTs)).not.toContain('incompatible')
+      expect(codexApi.executes).toHaveLength(2)
+      expect(codexApi.creates.at(-1)!.body.harness_type).toBe('codex')
+      expect(sessionMessageTexts(codexApi.appends.flatMap(append => append.body.messages)).join('\n'))
+        .toContain('work here?')
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CUSTOM_PROVIDERS
+      else process.env.CODEX_CUSTOM_PROVIDERS = previous
+    }
   })
 
   it('stays quiet when the classifier declines or fails', async () => {
